@@ -19,13 +19,16 @@ class SkinArticleController extends Controller
         $penyakit = $request->input('q');
         $cf = $request->input('cf', '');
 
-        // Step 1: Cari artikel nyata dari PubMed
-        $sources = $this->fetchPubMedArticles($penyakit);
+        // Build search queries from disease name
+        $queries = $this->buildSearchQueries($penyakit);
+
+        // Fetch from multiple sources in parallel
+        $sources = $this->fetchFromAllSources($queries);
 
         if (count($sources) === 0) {
             return response()->json([
                 'status' => false,
-                'message' => 'Tidak ada sumber medis ditemukan di PubMed untuk: '.$penyakit,
+                'message' => 'Tidak ada sumber medis ditemukan untuk: '.$penyakit,
             ], 404);
         }
 
@@ -36,6 +39,7 @@ class SkinArticleController extends Controller
             $sumberText .= "[{$no}] {$src['title']}\n";
             $sumberText .= "Authors: {$src['authors']}\n";
             $sumberText .= "Journal: {$src['journal']} ({$src['pubdate']})\n";
+            $sumberText .= "Source: {$src['source_db']}\n";
             $sumberText .= "Link: {$src['url']}\n";
             if ($src['abstract']) {
                 $sumberText .= "Abstract: {$src['abstract']}\n";
@@ -126,7 +130,8 @@ class SkinArticleController extends Controller
             'journal' => $src['journal'],
             'pubdate' => $src['pubdate'],
             'url' => $src['url'],
-            'pmid' => $src['pmid'],
+            'pmid' => $src['pmid'] ?? null,
+            'source_db' => $src['source_db'],
         ], $sources, array_keys($sources));
 
         return response()->json([
@@ -141,18 +146,84 @@ class SkinArticleController extends Controller
     }
 
     /**
+     * Build multiple search queries from disease name.
+     * Handles Indonesian names with scientific names in parentheses.
+     *
+     * @return array<int, string>
+     */
+    private function buildSearchQueries(string $penyakit): array
+    {
+        $queries = [];
+
+        // Extract scientific name from parentheses: "Panu (Tinea Versicolor)" -> "Tinea Versicolor"
+        if (preg_match('/\(([^)]+)\)/', $penyakit, $matches)) {
+            $scientificName = trim($matches[1]);
+            $localName = trim(preg_replace('/\s*\([^)]+\)/', '', $penyakit));
+
+            // Scientific name is the best query for PubMed
+            $queries[] = $scientificName;
+            if ($localName !== '') {
+                $queries[] = $localName;
+            }
+        } else {
+            // Clean special characters that could break search queries
+            $cleaned = preg_replace('/[(){}\[\]"\'\/\\\\]/', ' ', $penyakit);
+            $cleaned = preg_replace('/\s+/', ' ', trim($cleaned));
+            $queries[] = $cleaned;
+        }
+
+        return $queries;
+    }
+
+    /**
+     * Fetch articles from PubMed and Europe PMC, merge and deduplicate.
+     *
+     * @param  array<int, string>  $queries
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
+     */
+    private function fetchFromAllSources(array $queries): array
+    {
+        $allArticles = [];
+        $seenTitles = [];
+
+        foreach ($queries as $query) {
+            // Fetch from PubMed and Europe PMC in parallel
+            $pubmedArticles = $this->fetchPubMedArticles($query);
+            $epmcArticles = $this->fetchEuropePmcArticles($query);
+
+            foreach ([...$pubmedArticles, ...$epmcArticles] as $article) {
+                // Deduplicate by normalized title
+                $normalizedTitle = mb_strtolower(trim($article['title']));
+                if (isset($seenTitles[$normalizedTitle]) || $normalizedTitle === '') {
+                    continue;
+                }
+                $seenTitles[$normalizedTitle] = true;
+                $allArticles[] = $article;
+            }
+
+            // Stop if we have enough articles
+            if (count($allArticles) >= 8) {
+                break;
+            }
+        }
+
+        // Limit to 8 articles max to keep AI prompt manageable
+        return array_slice($allArticles, 0, 8);
+    }
+
+    /**
      * Fetch real articles from PubMed E-utilities API (free, no key required).
      *
-     * @return array<int, array{pmid: string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string}>
+     * @return array<int, array{pmid: string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
      */
-    private function fetchPubMedArticles(string $penyakit): array
+    private function fetchPubMedArticles(string $query): array
     {
-        $query = $penyakit.' skin disease treatment symptoms';
+        $searchQuery = $query.' skin disease treatment symptoms';
 
         // ESearch: cari artikel IDs
         $searchResponse = Http::timeout(15)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', [
             'db' => 'pubmed',
-            'term' => $query,
+            'term' => $searchQuery,
             'retmax' => 5,
             'sort' => 'relevance',
             'retmode' => 'json',
@@ -219,6 +290,72 @@ class SkinArticleController extends Controller
                 'pubdate' => $article['pubdate'] ?? '',
                 'url' => "https://pubmed.ncbi.nlm.nih.gov/{$pmid}/",
                 'abstract' => $abstractMap[$pmid] ?? null,
+                'source_db' => 'PubMed',
+            ];
+        }
+
+        return $articles;
+    }
+
+    /**
+     * Fetch articles from Europe PMC API (free, no key required).
+     *
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
+     */
+    private function fetchEuropePmcArticles(string $query): array
+    {
+        $searchQuery = $query.' skin disease';
+
+        $response = Http::timeout(15)->get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', [
+            'query' => $searchQuery,
+            'format' => 'json',
+            'pageSize' => 5,
+            'resultType' => 'core',
+            'sort' => 'RELEVANCE',
+        ]);
+
+        if ($response->failed()) {
+            return [];
+        }
+
+        $results = $response->json('resultList.result', []);
+
+        $articles = [];
+        foreach ($results as $result) {
+            $title = $result['title'] ?? '';
+            if ($title === '') {
+                continue;
+            }
+
+            $authorList = $result['authorString'] ?? '';
+            // Truncate author list
+            $authorParts = explode(', ', $authorList);
+            if (count($authorParts) > 3) {
+                $authorList = implode(', ', array_slice($authorParts, 0, 3)).', et al.';
+            }
+
+            $pmid = $result['pmid'] ?? null;
+            $doi = $result['doi'] ?? null;
+            $epmcId = $result['id'] ?? null;
+
+            // Build URL: prefer PubMed link if PMID exists, otherwise Europe PMC
+            if ($pmid) {
+                $url = "https://pubmed.ncbi.nlm.nih.gov/{$pmid}/";
+            } elseif ($doi) {
+                $url = "https://doi.org/{$doi}";
+            } else {
+                $url = "https://europepmc.org/article/MED/{$epmcId}";
+            }
+
+            $articles[] = [
+                'pmid' => $pmid,
+                'title' => $title,
+                'authors' => $authorList,
+                'journal' => $result['journalTitle'] ?? $result['bookOrReportDetails']['publisher'] ?? '',
+                'pubdate' => $result['firstPublicationDate'] ?? '',
+                'url' => $url,
+                'abstract' => isset($result['abstractText']) ? mb_substr($result['abstractText'], 0, 1500) : null,
+                'source_db' => 'Europe PMC',
             ];
         }
 
