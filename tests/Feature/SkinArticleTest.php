@@ -11,6 +11,22 @@ test('skin article requires q parameter', function () {
 
 test('skin article fetches pubmed and europe pmc sources and returns article from groq', function () {
     Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            // First call: translation
+            ->push([
+                'choices' => [['message' => ['content' => 'Eczema']]],
+            ])
+            // Second call: article generation
+            ->push([
+                'choices' => [
+                    [
+                        'message' => [
+                            'content' => "## Tentang Penyakit\nEczema adalah kondisi kulit [1]. Penyebabnya melibatkan faktor genetik [2].\n\n## Gejala\n- Kulit kering [1]\n- Gatal [1,2]",
+                        ],
+                    ],
+                ],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => ['12345678', '87654321'],
@@ -50,16 +66,6 @@ test('skin article fetches pubmed and europe pmc sources and returns article fro
                 ],
             ],
         ]),
-        'api.groq.com/*' => Http::response([
-            'choices' => [
-                [
-                    'message' => [
-                        'content' => "## Tentang Penyakit\nEczema adalah kondisi kulit [1]. Penyebabnya melibatkan faktor genetik [2].\n\n## Gejala\n- Kulit kering [1]\n- Gatal [1,2]",
-                    ],
-                ],
-            ],
-            'model' => 'llama-3.3-70b-versatile',
-        ]),
     ]);
 
     $response = $this->getJson('/api/skin-article?q=eczema&cf=85');
@@ -87,7 +93,7 @@ test('skin article fetches pubmed and europe pmc sources and returns article fro
     expect($referensi[0]['source_db'])->toBe('PubMed');
 });
 
-test('skin article handles disease names with parentheses', function () {
+test('skin article handles disease names with parentheses without translation', function () {
     Http::fake([
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
@@ -134,7 +140,7 @@ test('skin article handles disease names with parentheses', function () {
         ]),
     ]);
 
-    // This query previously caused HTTP 404 because parentheses broke PubMed search
+    // Parentheses format skips translation - extracts scientific name directly
     $response = $this->getJson('/api/skin-article?q='.urlencode('Panu (Tinea Versicolor)').'&cf=80');
 
     $response->assertStatus(200)
@@ -146,8 +152,64 @@ test('skin article handles disease names with parentheses', function () {
     expect($response->json('jumlah_sumber'))->toBeGreaterThanOrEqual(1);
 });
 
+test('skin article translates indonesian disease name to english', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            // First call: translation - "Karsinoma Sel Basal" -> "Basal Cell Carcinoma"
+            ->push([
+                'choices' => [['message' => ['content' => 'Basal Cell Carcinoma']]],
+            ])
+            // Second call: article generation
+            ->push([
+                'choices' => [
+                    [
+                        'message' => [
+                            'content' => "## Tentang Penyakit\nKarsinoma sel basal adalah kanker kulit [1].\n\n## Gejala\n- Benjolan pada kulit [1]",
+                        ],
+                    ],
+                ],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => [
+                'idlist' => ['55555555'],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi*' => Http::response([
+            'result' => [
+                '55555555' => [
+                    'title' => 'Basal cell carcinoma: pathogenesis and treatment',
+                    'authors' => [['name' => 'Chen W']],
+                    'fulljournalname' => 'Oncology Journal',
+                    'pubdate' => '2024 Mar',
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi*' => Http::response(
+            '1. Chen W. Basal cell carcinoma: pathogenesis and treatment. This abstract covers the pathogenesis and modern treatment approaches for basal cell carcinoma including surgery and immunotherapy.'
+        ),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => ['result' => []],
+        ]),
+    ]);
+
+    // Indonesian name that previously would fail
+    $response = $this->getJson('/api/skin-article?q='.urlencode('Karsinoma Sel Basal').'&cf=80');
+
+    $response->assertStatus(200)
+        ->assertJson([
+            'status' => true,
+            'penyakit' => 'Karsinoma Sel Basal',
+        ]);
+
+    expect($response->json('jumlah_sumber'))->toBeGreaterThanOrEqual(1);
+});
+
 test('skin article returns 404 when no sources found from any provider', function () {
     Http::fake([
+        'api.groq.com/*' => Http::response([
+            'choices' => [['message' => ['content' => 'xyznotadisease']]],
+        ]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => [],
@@ -170,6 +232,11 @@ test('skin article returns 404 when no sources found from any provider', functio
 
 test('skin article handles groq api failure', function () {
     Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            // Translation call fails - should still try with original name
+            ->push(['error' => 'rate limited'], 429)
+            // Article generation also fails
+            ->push(['error' => 'rate limited'], 429),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => ['idlist' => ['11111111']],
         ]),
@@ -187,7 +254,6 @@ test('skin article handles groq api failure', function () {
         'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
             'resultList' => ['result' => []],
         ]),
-        'api.groq.com/*' => Http::response(['error' => 'rate limited'], 429),
     ]);
 
     $response = $this->getJson('/api/skin-article?q=psoriasis&cf=70');
@@ -198,6 +264,22 @@ test('skin article handles groq api failure', function () {
 
 test('skin article falls back to europe pmc when pubmed returns no results', function () {
     Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            // Translation call
+            ->push([
+                'choices' => [['message' => ['content' => 'Ringworm']]],
+            ])
+            // Article generation
+            ->push([
+                'choices' => [
+                    [
+                        'message' => [
+                            'content' => "## Tentang Penyakit\nInfeksi jamur kulit [1].\n\n## Gejala\n- Gatal [1]",
+                        ],
+                    ],
+                ],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => [],
@@ -226,16 +308,6 @@ test('skin article falls back to europe pmc when pubmed returns no results', fun
                     ],
                 ],
             ],
-        ]),
-        'api.groq.com/*' => Http::response([
-            'choices' => [
-                [
-                    'message' => [
-                        'content' => "## Tentang Penyakit\nInfeksi jamur kulit [1].\n\n## Gejala\n- Gatal [1]",
-                    ],
-                ],
-            ],
-            'model' => 'llama-3.3-70b-versatile',
         ]),
     ]);
 

@@ -147,7 +147,7 @@ class SkinArticleController extends Controller
 
     /**
      * Build multiple search queries from disease name.
-     * Handles Indonesian names with scientific names in parentheses.
+     * Uses AI to translate Indonesian disease names to English medical terms.
      *
      * @return array<int, string>
      */
@@ -160,19 +160,70 @@ class SkinArticleController extends Controller
             $scientificName = trim($matches[1]);
             $localName = trim(preg_replace('/\s*\([^)]+\)/', '', $penyakit));
 
-            // Scientific name is the best query for PubMed
             $queries[] = $scientificName;
             if ($localName !== '') {
                 $queries[] = $localName;
             }
-        } else {
-            // Clean special characters that could break search queries
-            $cleaned = preg_replace('/[(){}\[\]"\'\/\\\\]/', ' ', $penyakit);
-            $cleaned = preg_replace('/\s+/', ' ', trim($cleaned));
-            $queries[] = $cleaned;
+
+            return $queries;
         }
 
+        // Clean special characters
+        $cleaned = preg_replace('/[(){}\[\]"\'\/\\\\]/', ' ', $penyakit);
+        $cleaned = preg_replace('/\s+/', ' ', trim($cleaned));
+
+        // Use AI to translate Indonesian disease name to English medical term
+        $englishName = $this->translateToMedicalEnglish($cleaned);
+
+        if ($englishName && mb_strtolower($englishName) !== mb_strtolower($cleaned)) {
+            $queries[] = $englishName;
+        }
+        $queries[] = $cleaned;
+
         return $queries;
+    }
+
+    /**
+     * Translate Indonesian disease name to English medical term using Groq AI.
+     * Uses a fast, low-token call for translation only.
+     */
+    private function translateToMedicalEnglish(string $diseaseName): ?string
+    {
+        $response = Http::timeout(10)
+            ->connectTimeout(5)
+            ->withHeaders([
+                'Authorization' => 'Bearer '.config('services.groq.key'),
+            ])
+            ->post('https://api.groq.com/openai/v1/chat/completions', [
+                'model' => config('services.groq.model'),
+                'messages' => [
+                    [
+                        'role' => 'system',
+                        'content' => 'You are a medical translator. Translate the given disease name to its English medical/scientific term. Reply with ONLY the English term, nothing else. If the input is already in English, return it as-is.',
+                    ],
+                    [
+                        'role' => 'user',
+                        'content' => $diseaseName,
+                    ],
+                ],
+                'temperature' => 0,
+                'max_tokens' => 50,
+            ]);
+
+        if ($response->failed()) {
+            return null;
+        }
+
+        $content = $response->json('choices.0.message.content');
+
+        if (! $content) {
+            return null;
+        }
+
+        // Clean up response - remove quotes, periods, extra whitespace
+        $content = trim($content, " \t\n\r\0\x0B.\"'");
+
+        return $content !== '' ? $content : null;
     }
 
     /**
