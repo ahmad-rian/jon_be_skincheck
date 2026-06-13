@@ -647,3 +647,96 @@ test('skin article orders indonesian sources before international', function () 
     expect($indonesianCount)->toBeGreaterThanOrEqual(1)->toBeLessThanOrEqual(5);
     expect($sources->whereNotIn('source_db', $indonesianDbs)->count())->toBeGreaterThanOrEqual(1);
 });
+
+test('skin article sends descriptive user agent to external sources', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Eczema']]]])
+            ->push([
+                'choices' => [['message' => ['content' => '## Tentang Penyakit\nEczema [1].']]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => []],
+        ]),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => [
+                'result' => [
+                    [
+                        'id' => '111',
+                        'pmid' => '111',
+                        'title' => 'Eczema review',
+                        'authorString' => 'Tan A',
+                        'journalTitle' => 'Derm Journal',
+                        'firstPublicationDate' => '2024-01-01',
+                        'abstractText' => 'A review of eczema management strategies with topical and systemic therapies for the condition.',
+                    ],
+                ],
+            ],
+        ]),
+    ]);
+
+    $this->getJson('/api/skin-article?q=eczema&cf=80')->assertStatus(200);
+
+    $appName = config('app.name');
+
+    // Wikipedia & DOAJ requests must carry a descriptive User-Agent (Wikimedia blocks generic UAs).
+    Http::assertSent(fn ($request) => str_contains($request->url(), 'id.wikipedia.org')
+        && str_contains($request->header('User-Agent')[0] ?? '', $appName));
+    Http::assertSent(fn ($request) => str_contains($request->url(), 'doaj.org')
+        && str_contains($request->header('User-Agent')[0] ?? '', $appName));
+});
+
+test('skin article deprioritizes veterinary doaj articles', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Scabies']]]])
+            ->push([
+                'choices' => [['message' => ['content' => '## Tentang Penyakit\nKudis [1].']]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response([
+            'results' => [
+                [
+                    'id' => 'vet',
+                    'bibjson' => [
+                        'title' => 'Distribusi Skabies pada Peternakan Sapi Potong',
+                        'author' => [['name' => 'Vet A']],
+                        'journal' => ['title' => 'Jurnal Peternakan'],
+                        'year' => '2023',
+                        'identifier' => [['type' => 'pissn', 'id' => '1111-2222']],
+                        'link' => [['type' => 'fulltext', 'url' => 'https://vet.example.id/1']],
+                    ],
+                ],
+                [
+                    'id' => 'human',
+                    'bibjson' => [
+                        'title' => 'Pengobatan Skabies pada Manusia di Pesantren',
+                        'author' => [['name' => 'Med B']],
+                        'journal' => ['title' => 'Jurnal Kedokteran'],
+                        'year' => '2023',
+                        'identifier' => [['type' => 'pissn', 'id' => '3333-4444']],
+                        'link' => [['type' => 'fulltext', 'url' => 'https://med.example.id/2']],
+                    ],
+                ],
+            ],
+        ]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => []],
+        ]),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => ['result' => []],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q=skabies&cf=80')->assertStatus(200);
+
+    $doaj = collect($response->json('referensi'))->where('source_db', 'DOAJ (Jurnal Indonesia)')->values();
+
+    // Human-medical article ranks before the veterinary one
+    expect($doaj[0]['title'])->toContain('Manusia');
+    expect($doaj[1]['title'])->toContain('Sapi');
+});

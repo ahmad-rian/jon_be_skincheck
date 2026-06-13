@@ -7,6 +7,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class SkinArticleController extends Controller
 {
@@ -90,6 +91,7 @@ class SkinArticleController extends Controller
 
         $aiResponse = Http::timeout(45)
             ->connectTimeout(10)
+            ->withUserAgent($this->userAgent())
             ->withHeaders([
                 'Authorization' => 'Bearer '.config('services.groq.key'),
             ])
@@ -198,6 +200,7 @@ class SkinArticleController extends Controller
     {
         $response = Http::timeout(10)
             ->connectTimeout(5)
+            ->withUserAgent($this->userAgent())
             ->withHeaders([
                 'Authorization' => 'Bearer '.config('services.groq.key'),
             ])
@@ -261,13 +264,15 @@ class SkinArticleController extends Controller
         // International search uses the best (translated) query; Indonesian sources use the local name.
         $primaryQuery = $queries[0] ?? $indonesianName;
 
+        $userAgent = $this->userAgent();
+
         // Stage 1: fire all independent source searches concurrently to avoid sequential timeouts.
         $stage1 = Http::pool(fn ($pool) => [
-            $pool->as('doaj')->timeout(10)->connectTimeout(5)->get(
+            $pool->as('doaj')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get(
                 'https://doaj.org/api/search/articles/'.rawurlencode($indonesianName.' AND index.language:Indonesian'),
-                ['pageSize' => 6, 'sort' => 'score:desc'],
+                ['pageSize' => 6],
             ),
-            $pool->as('wiki')->timeout(10)->connectTimeout(5)->get('https://id.wikipedia.org/w/api.php', [
+            $pool->as('wiki')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get('https://id.wikipedia.org/w/api.php', [
                 'action' => 'query',
                 'generator' => 'search',
                 'gsrsearch' => $indonesianName,
@@ -278,14 +283,14 @@ class SkinArticleController extends Controller
                 'inprop' => 'url',
                 'format' => 'json',
             ]),
-            $pool->as('epmc')->timeout(10)->connectTimeout(5)->get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', [
+            $pool->as('epmc')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', [
                 'query' => $primaryQuery.' skin disease',
                 'format' => 'json',
                 'pageSize' => 5,
                 'resultType' => 'core',
                 'sort' => 'RELEVANCE',
             ]),
-            $pool->as('pubmed_search')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', [
+            $pool->as('pubmed_search')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', [
                 'db' => 'pubmed',
                 'term' => $primaryQuery.' skin disease treatment symptoms',
                 'retmax' => 5,
@@ -333,6 +338,15 @@ class SkinArticleController extends Controller
     }
 
     /**
+     * Descriptive User-Agent. Required by Wikimedia (blocks generic UAs with HTTP 403) and
+     * avoids throttling on DOAJ. Includes app name and a contact URL.
+     */
+    private function userAgent(): string
+    {
+        return config('app.name', 'SkinCheckAI').'/1.0 (+'.config('app.url', 'https://localhost').')';
+    }
+
+    /**
      * Filter a batch of articles down to ones with an unseen, non-empty normalized title.
      * Mutates $seenTitles to track titles across batches.
      *
@@ -376,14 +390,16 @@ class SkinArticleController extends Controller
 
         $idString = implode(',', $ids);
 
+        $userAgent = $this->userAgent();
+
         // Fetch summary + abstracts in parallel
         $responses = Http::pool(fn ($pool) => [
-            $pool->as('summary')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', [
+            $pool->as('summary')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', [
                 'db' => 'pubmed',
                 'id' => $idString,
                 'retmode' => 'json',
             ]),
-            $pool->as('abstracts')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', [
+            $pool->as('abstracts')->withUserAgent($userAgent)->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', [
                 'db' => 'pubmed',
                 'id' => $idString,
                 'rettype' => 'abstract',
@@ -530,6 +546,10 @@ class SkinArticleController extends Controller
     private function parseWikipediaArticles(mixed $response): array
     {
         if (! $this->isSuccessfulResponse($response)) {
+            Log::warning('skin-article: Wikipedia Indonesia tidak sukses', [
+                'status' => $response instanceof Response ? $response->status() : 'connection-error',
+            ]);
+
             return [];
         }
 
@@ -557,6 +577,10 @@ class SkinArticleController extends Controller
             ];
         }
 
+        if ($articles === []) {
+            Log::warning('skin-article: Wikipedia Indonesia kosong (tidak ada page relevan)');
+        }
+
         return $articles;
     }
 
@@ -570,6 +594,10 @@ class SkinArticleController extends Controller
     private function parseDoajArticles(mixed $response): array
     {
         if (! $this->isSuccessfulResponse($response)) {
+            Log::warning('skin-article: DOAJ tidak sukses', [
+                'status' => $response instanceof Response ? $response->status() : 'connection-error',
+            ]);
+
             return [];
         }
 
@@ -609,7 +637,26 @@ class SkinArticleController extends Controller
             ];
         }
 
+        if ($articles === []) {
+            Log::warning('skin-article: DOAJ kosong (tidak ada artikel berbahasa Indonesia)');
+        }
+
+        // Accuracy: keep human/medical articles ahead of veterinary ones (don't drop, just rank lower).
+        usort($articles, fn ($a, $b) => $this->isVeterinaryArticle($a) <=> $this->isVeterinaryArticle($b));
+
         return $articles;
+    }
+
+    /**
+     * Heuristic: whether a DOAJ article is veterinary/animal-focused (less relevant for human skin disease).
+     *
+     * @param  array{title: string, journal: string, abstract: ?string}  $article
+     */
+    private function isVeterinaryArticle(array $article): bool
+    {
+        $haystack = mb_strtolower($article['title'].' '.$article['journal'].' '.($article['abstract'] ?? ''));
+
+        return preg_match('/\b(sapi|ternak|peternakan|unggas|ayam|kambing|domba|babi|kucing|anjing|hewan|veteriner|kerbau|kuda)\b/u', $haystack) === 1;
     }
 
     /**
