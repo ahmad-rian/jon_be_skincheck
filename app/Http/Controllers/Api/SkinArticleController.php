@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use Illuminate\Http\Client\Response;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
@@ -87,8 +88,8 @@ class SkinArticleController extends Controller
         (paragraf, cantumkan nomor rujukan)
         PROMPT;
 
-        $aiResponse = Http::timeout(60)
-            ->connectTimeout(15)
+        $aiResponse = Http::timeout(45)
+            ->connectTimeout(10)
             ->withHeaders([
                 'Authorization' => 'Bearer '.config('services.groq.key'),
             ])
@@ -254,29 +255,59 @@ class SkinArticleController extends Controller
     private function fetchFromAllSources(array $queries, string $indonesianName): array
     {
         $maxTotal = 8;
-        $indonesianQuota = 3;
+        $indonesianQuota = 5;
         $seenTitles = [];
 
-        // Indonesian / openable sources searched with the local Indonesian name:
-        // DOAJ journals first (scientific), then Wikipedia Indonesia (always openable).
+        // International search uses the best (translated) query; Indonesian sources use the local name.
+        $primaryQuery = $queries[0] ?? $indonesianName;
+
+        // Stage 1: fire all independent source searches concurrently to avoid sequential timeouts.
+        $stage1 = Http::pool(fn ($pool) => [
+            $pool->as('doaj')->timeout(10)->connectTimeout(5)->get(
+                'https://doaj.org/api/search/articles/'.rawurlencode($indonesianName.' AND index.language:Indonesian'),
+                ['pageSize' => 6, 'sort' => 'score:desc'],
+            ),
+            $pool->as('wiki')->timeout(10)->connectTimeout(5)->get('https://id.wikipedia.org/w/api.php', [
+                'action' => 'query',
+                'generator' => 'search',
+                'gsrsearch' => $indonesianName,
+                'gsrlimit' => 2,
+                'prop' => 'extracts|info',
+                'exintro' => 1,
+                'explaintext' => 1,
+                'inprop' => 'url',
+                'format' => 'json',
+            ]),
+            $pool->as('epmc')->timeout(10)->connectTimeout(5)->get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', [
+                'query' => $primaryQuery.' skin disease',
+                'format' => 'json',
+                'pageSize' => 5,
+                'resultType' => 'core',
+                'sort' => 'RELEVANCE',
+            ]),
+            $pool->as('pubmed_search')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', [
+                'db' => 'pubmed',
+                'term' => $primaryQuery.' skin disease treatment symptoms',
+                'retmax' => 5,
+                'sort' => 'relevance',
+                'retmode' => 'json',
+            ]),
+        ]);
+
+        // Indonesian / openable sources first: DOAJ journals, then Wikipedia Indonesia.
         $indonesian = $this->collectUnique([
-            ...$this->fetchDoajIndonesianArticles($indonesianName),
-            ...$this->fetchWikipediaIndonesiaArticles($indonesianName),
+            ...$this->parseDoajArticles($stage1['doaj']),
+            ...$this->parseWikipediaArticles($stage1['wiki']),
         ], $seenTitles);
 
-        // International sources (PubMed + Europe PMC) across all queries
-        $international = [];
-        foreach ($queries as $query) {
-            $batch = [...$this->fetchPubMedArticles($query), ...$this->fetchEuropePmcArticles($query)];
-            $international = [...$international, ...$this->collectUnique($batch, $seenTitles)];
+        // International sources (PubMed needs a second pooled call for summaries/abstracts).
+        $international = $this->collectUnique([
+            ...$this->fetchPubMedSummaries($stage1['pubmed_search']),
+            ...$this->parseEpmcArticles($stage1['epmc']),
+        ], $seenTitles);
 
-            if (count($international) >= $maxTotal) {
-                break;
-            }
-        }
-
-        // Compose: reserve up to $indonesianQuota slots for Indonesian sources, fill the rest
-        // with international, then top up with any leftover Indonesian articles.
+        // Compose: Indonesian sources first (up to quota), then fill remaining slots with
+        // international, then top up with any leftover Indonesian articles.
         $reservedIndonesian = array_slice($indonesian, 0, $indonesianQuota);
         $remainingSlots = $maxTotal - count($reservedIndonesian);
 
@@ -290,6 +321,15 @@ class SkinArticleController extends Controller
         }
 
         return array_slice($merged, 0, $maxTotal);
+    }
+
+    /**
+     * Whether a pooled response is a usable, successful HTTP response.
+     * Http::pool returns a ConnectionException (not a Response) when a request fails to connect.
+     */
+    private function isSuccessfulResponse(mixed $response): bool
+    {
+        return $response instanceof Response && $response->successful();
     }
 
     /**
@@ -317,28 +357,18 @@ class SkinArticleController extends Controller
     }
 
     /**
-     * Fetch real articles from PubMed E-utilities API (free, no key required).
+     * Fetch PubMed article summaries/abstracts from an esearch response (free, no key required).
+     * Runs a second pooled call for summary + abstracts.
      *
-     * @return array<int, array{pmid: string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
+     * @return array<int, array{pmid: string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
      */
-    private function fetchPubMedArticles(string $query): array
+    private function fetchPubMedSummaries(mixed $esearchResponse): array
     {
-        $searchQuery = $query.' skin disease treatment symptoms';
-
-        // ESearch: cari artikel IDs
-        $searchResponse = Http::timeout(15)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi', [
-            'db' => 'pubmed',
-            'term' => $searchQuery,
-            'retmax' => 5,
-            'sort' => 'relevance',
-            'retmode' => 'json',
-        ]);
-
-        if ($searchResponse->failed()) {
+        if (! $this->isSuccessfulResponse($esearchResponse)) {
             return [];
         }
 
-        $ids = $searchResponse->json('esearchresult.idlist', []);
+        $ids = $esearchResponse->json('esearchresult.idlist', []);
 
         if (count($ids) === 0) {
             return [];
@@ -348,12 +378,12 @@ class SkinArticleController extends Controller
 
         // Fetch summary + abstracts in parallel
         $responses = Http::pool(fn ($pool) => [
-            $pool->as('summary')->timeout(15)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', [
+            $pool->as('summary')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi', [
                 'db' => 'pubmed',
                 'id' => $idString,
                 'retmode' => 'json',
             ]),
-            $pool->as('abstracts')->timeout(15)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', [
+            $pool->as('abstracts')->timeout(10)->connectTimeout(5)->get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', [
                 'db' => 'pubmed',
                 'id' => $idString,
                 'rettype' => 'abstract',
@@ -361,12 +391,12 @@ class SkinArticleController extends Controller
             ]),
         ]);
 
-        if ($responses['summary']->failed()) {
+        if (! $this->isSuccessfulResponse($responses['summary'])) {
             return [];
         }
 
         $summaryData = $responses['summary']->json('result', []);
-        $abstractsRaw = $responses['abstracts']->successful() ? $responses['abstracts']->body() : '';
+        $abstractsRaw = $this->isSuccessfulResponse($responses['abstracts']) ? $responses['abstracts']->body() : '';
 
         // Parse abstracts per PMID
         $abstractMap = $this->parseAbstracts($abstractsRaw, $ids);
@@ -405,23 +435,13 @@ class SkinArticleController extends Controller
     }
 
     /**
-     * Fetch articles from Europe PMC API (free, no key required).
+     * Parse articles from a Europe PMC search response (free, no key required).
      *
-     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
      */
-    private function fetchEuropePmcArticles(string $query): array
+    private function parseEpmcArticles(mixed $response): array
     {
-        $searchQuery = $query.' skin disease';
-
-        $response = Http::timeout(15)->get('https://www.ebi.ac.uk/europepmc/webservices/rest/search', [
-            'query' => $searchQuery,
-            'format' => 'json',
-            'pageSize' => 5,
-            'resultType' => 'core',
-            'sort' => 'RELEVANCE',
-        ]);
-
-        if ($response->failed()) {
+        if (! $this->isSuccessfulResponse($response)) {
             return [];
         }
 
@@ -502,30 +522,14 @@ class SkinArticleController extends Controller
     }
 
     /**
-     * Fetch openable Indonesian-language articles from Wikipedia Indonesia (MediaWiki API, free).
+     * Parse openable Indonesian-language articles from a Wikipedia Indonesia (MediaWiki) response.
      * Always open access — useful as a user-friendly, directly-readable reference.
      *
      * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
      */
-    private function fetchWikipediaIndonesiaArticles(string $query): array
+    private function parseWikipediaArticles(mixed $response): array
     {
-        if (trim($query) === '') {
-            return [];
-        }
-
-        $response = Http::timeout(15)->get('https://id.wikipedia.org/w/api.php', [
-            'action' => 'query',
-            'generator' => 'search',
-            'gsrsearch' => $query,
-            'gsrlimit' => 2,
-            'prop' => 'extracts|info',
-            'exintro' => 1,
-            'explaintext' => 1,
-            'inprop' => 'url',
-            'format' => 'json',
-        ]);
-
-        if ($response->failed()) {
+        if (! $this->isSuccessfulResponse($response)) {
             return [];
         }
 
@@ -557,30 +561,15 @@ class SkinArticleController extends Controller
     }
 
     /**
-     * Fetch Indonesian-language journal articles from the DOAJ API (free, no key required).
+     * Parse Indonesian-language journal articles from a DOAJ API response (free, no key required).
      * Filtered to Indonesian-language journals as a practical proxy for Indonesian (Sinta-indexed)
      * journals — DOAJ does not expose Sinta accreditation levels.
      *
      * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
      */
-    private function fetchDoajIndonesianArticles(string $query): array
+    private function parseDoajArticles(mixed $response): array
     {
-        if (trim($query) === '') {
-            return [];
-        }
-
-        // Restrict to Indonesian-language journals so references are genuinely Indonesian.
-        $searchQuery = $query.' AND index.language:Indonesian';
-
-        $response = Http::timeout(15)->get(
-            'https://doaj.org/api/search/articles/'.rawurlencode($searchQuery),
-            [
-                'pageSize' => 5,
-                'sort' => 'score:desc',
-            ]
-        );
-
-        if ($response->failed()) {
+        if (! $this->isSuccessfulResponse($response)) {
             return [];
         }
 

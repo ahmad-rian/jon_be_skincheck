@@ -543,3 +543,107 @@ test('skin article prefers europe pmc open access fulltext url', function () {
     expect($ref['url'])->toBe('https://europepmc.org/articles/PMC12121212');
     expect($ref['is_open_access'])->toBeTrue();
 });
+
+test('skin article orders indonesian sources before international', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Acne']]]])
+            ->push([
+                'choices' => [['message' => ['content' => "## Tentang Penyakit\nJerawat [1]."]]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response([
+            'results' => [
+                [
+                    'id' => 'id1',
+                    'bibjson' => [
+                        'title' => 'Faktor Risiko Jerawat pada Remaja Indonesia',
+                        'author' => [['name' => 'Andi P']],
+                        'journal' => ['title' => 'Jurnal Dermatologi Indonesia'],
+                        'year' => '2023',
+                        'identifier' => [['type' => 'pissn', 'id' => '2222-3333']],
+                        'link' => [['type' => 'fulltext', 'url' => 'https://jdi.example.id/1']],
+                    ],
+                ],
+                [
+                    'id' => 'id2',
+                    'bibjson' => [
+                        'title' => 'Pengobatan Jerawat dengan Bahan Alami',
+                        'author' => [['name' => 'Sri W']],
+                        'journal' => ['title' => 'Jurnal Farmasi Indonesia'],
+                        'year' => '2022',
+                        'identifier' => [['type' => 'pissn', 'id' => '4444-5555']],
+                        'link' => [['type' => 'fulltext', 'url' => 'https://jfi.example.id/2']],
+                    ],
+                ],
+            ],
+        ]),
+        'id.wikipedia.org/*' => Http::response([
+            'query' => [
+                'pages' => [
+                    '99' => [
+                        'pageid' => 99,
+                        'title' => 'Jerawat',
+                        'extract' => 'Jerawat adalah kondisi kulit yang terjadi ketika folikel rambut tersumbat oleh minyak dan sel kulit mati.',
+                        'fullurl' => 'https://id.wikipedia.org/wiki/Jerawat',
+                    ],
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => ['10101010', '20202020']],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi*' => Http::response([
+            'result' => [
+                '10101010' => [
+                    'title' => 'Acne vulgaris pathogenesis',
+                    'authors' => [['name' => 'Smith J']],
+                    'fulljournalname' => 'Journal of Dermatology',
+                    'pubdate' => '2024',
+                ],
+                '20202020' => [
+                    'title' => 'Acne treatment guidelines',
+                    'authors' => [['name' => 'Doe A']],
+                    'fulljournalname' => 'Dermatology Today',
+                    'pubdate' => '2023',
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi*' => Http::response(
+            "1. Smith J. Acne vulgaris pathogenesis. A detailed abstract about the pathogenesis of acne vulgaris including hormonal and bacterial factors contributing to the condition.\n\n2. Doe A. Acne treatment guidelines. A comprehensive abstract about acne treatment guidelines including topical retinoids and oral antibiotics for managing acne effectively."
+        ),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => [
+                'result' => [
+                    [
+                        'id' => '30303030',
+                        'pmid' => '30303030',
+                        'title' => 'Acne management review',
+                        'authorString' => 'Garcia M',
+                        'journalTitle' => 'European Journal of Dermatology',
+                        'firstPublicationDate' => '2024-01-01',
+                        'abstractText' => 'A review of acne management strategies including modern topical and systemic therapies for various severities.',
+                    ],
+                ],
+            ],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q=jerawat&cf=80');
+
+    $response->assertStatus(200)->assertJson(['status' => true]);
+
+    $sources = collect($response->json('referensi'));
+    $indonesianDbs = ['DOAJ (Jurnal Indonesia)', 'Wikipedia Indonesia'];
+
+    // All Indonesian sources must appear before any international source
+    $firstInternationalIndex = $sources->search(fn ($s) => ! in_array($s['source_db'], $indonesianDbs, true));
+    $lastIndonesianIndex = $sources->filter(fn ($s) => in_array($s['source_db'], $indonesianDbs, true))->keys()->max();
+
+    expect($lastIndonesianIndex)->toBeLessThan($firstInternationalIndex);
+
+    // Mix is preserved: both Indonesian and international present, ID capped at 5
+    $indonesianCount = $sources->whereIn('source_db', $indonesianDbs)->count();
+    expect($indonesianCount)->toBeGreaterThanOrEqual(1)->toBeLessThanOrEqual(5);
+    expect($sources->whereNotIn('source_db', $indonesianDbs)->count())->toBeGreaterThanOrEqual(1);
+});
