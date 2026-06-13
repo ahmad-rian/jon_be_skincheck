@@ -27,6 +27,8 @@ test('skin article fetches pubmed and europe pmc sources and returns article fro
                 ],
                 'model' => 'llama-3.3-70b-versatile',
             ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => ['12345678', '87654321'],
@@ -95,6 +97,8 @@ test('skin article fetches pubmed and europe pmc sources and returns article fro
 
 test('skin article handles disease names with parentheses without translation', function () {
     Http::fake([
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => ['11111111'],
@@ -170,6 +174,8 @@ test('skin article translates indonesian disease name to english', function () {
                 ],
                 'model' => 'llama-3.3-70b-versatile',
             ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => ['55555555'],
@@ -210,6 +216,8 @@ test('skin article returns 404 when no sources found from any provider', functio
         'api.groq.com/*' => Http::response([
             'choices' => [['message' => ['content' => 'xyznotadisease']]],
         ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => [],
@@ -237,6 +245,8 @@ test('skin article handles groq api failure', function () {
             ->push(['error' => 'rate limited'], 429)
             // Article generation also fails
             ->push(['error' => 'rate limited'], 429),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => ['idlist' => ['11111111']],
         ]),
@@ -280,6 +290,8 @@ test('skin article falls back to europe pmc when pubmed returns no results', fun
                 ],
                 'model' => 'llama-3.3-70b-versatile',
             ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
         'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
             'esearchresult' => [
                 'idlist' => [],
@@ -320,4 +332,214 @@ test('skin article falls back to europe pmc when pubmed returns no results', fun
     expect(count($referensi))->toBe(2);
     expect($referensi[0]['source_db'])->toBe('Europe PMC');
     expect($referensi[1]['source_db'])->toBe('Europe PMC');
+});
+
+test('skin article includes indonesian doaj source mixed with international', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Tinea Versicolor']]]])
+            ->push([
+                'choices' => [['message' => ['content' => "## Tentang Penyakit\nPanu adalah infeksi jamur [1][2].\n\n## Gejala\n- Bercak [1]"]]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response([
+            'results' => [
+                [
+                    'id' => 'abc123',
+                    'bibjson' => [
+                        'title' => 'Pengobatan Panu dengan Antijamur Topikal',
+                        'author' => [['name' => 'Budi Santoso'], ['name' => 'Siti Aminah']],
+                        'journal' => ['title' => 'Jurnal Kedokteran Indonesia'],
+                        'year' => '2023',
+                        'month' => '06',
+                        'abstract' => 'Studi mengenai efektivitas pengobatan panu menggunakan terapi antijamur topikal pada pasien Indonesia.',
+                        'identifier' => [
+                            ['type' => 'pissn', 'id' => '1234-5678'],
+                            ['type' => 'doi', 'id' => '10.1234/jki.2023.001'],
+                        ],
+                        'link' => [
+                            ['type' => 'fulltext', 'url' => 'https://jki.example.id/article/1'],
+                        ],
+                    ],
+                ],
+            ],
+        ]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => ['77777777']],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi*' => Http::response([
+            'result' => [
+                '77777777' => [
+                    'title' => 'Tinea versicolor management review',
+                    'authors' => [['name' => 'Smith J']],
+                    'fulljournalname' => 'International Journal of Dermatology',
+                    'pubdate' => '2024 Jan',
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi*' => Http::response(
+            '1. Smith J. Tinea versicolor management review. A detailed abstract about antifungal treatment options for tinea versicolor including topical and systemic therapies for managing the condition.'
+        ),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => ['result' => []],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q='.urlencode('Panu (Tinea Versicolor)').'&cf=80');
+
+    $response->assertStatus(200)
+        ->assertJson(['status' => true]);
+
+    $sources = collect($response->json('referensi'));
+
+    // References must mix Indonesian (DOAJ) + international sources, never fully English
+    expect($sources->pluck('source_db'))->toContain('DOAJ (Jurnal Indonesia)');
+    expect($sources->whereNotIn('source_db', ['DOAJ (Jurnal Indonesia)'])->count())->toBeGreaterThanOrEqual(1);
+
+    $doaj = $sources->firstWhere('source_db', 'DOAJ (Jurnal Indonesia)');
+    expect($doaj['issn'])->toBe('1234-5678');
+    expect($doaj['url'])->toBe('https://jki.example.id/article/1');
+});
+
+test('skin article still works when no indonesian source found', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Psoriasis']]]])
+            ->push([
+                'choices' => [['message' => ['content' => "## Tentang Penyakit\nPsoriasis [1]."]]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => ['88888888']],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi*' => Http::response([
+            'result' => [
+                '88888888' => [
+                    'title' => 'Psoriasis treatment review',
+                    'authors' => [['name' => 'Doe A']],
+                    'fulljournalname' => 'Dermatology Journal',
+                    'pubdate' => '2024',
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi*' => Http::response(
+            '1. Doe A. Psoriasis treatment review. A comprehensive abstract about psoriasis treatment including biologics and topical therapies for managing this chronic skin condition effectively.'
+        ),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => ['result' => []],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q=psoriasis&cf=70');
+
+    $response->assertStatus(200)
+        ->assertJson(['status' => true]);
+
+    expect($response->json('jumlah_sumber'))->toBeGreaterThanOrEqual(1);
+});
+
+test('skin article includes wikipedia indonesia as openable source', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Scabies']]]])
+            ->push([
+                'choices' => [['message' => ['content' => "## Tentang Penyakit\nKudis [1]."]]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response([
+            'query' => [
+                'pages' => [
+                    '4567' => [
+                        'pageid' => 4567,
+                        'title' => 'Skabies',
+                        'extract' => 'Skabies atau kudis adalah penyakit kulit menular yang disebabkan oleh tungau Sarcoptes scabiei. Penyakit ini menimbulkan rasa gatal terutama pada malam hari.',
+                        'fullurl' => 'https://id.wikipedia.org/wiki/Skabies',
+                    ],
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => ['66666666']],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi*' => Http::response([
+            'result' => [
+                '66666666' => [
+                    'title' => 'Scabies treatment review',
+                    'authors' => [['name' => 'Lee K']],
+                    'fulljournalname' => 'Dermatology Journal',
+                    'pubdate' => '2024',
+                ],
+            ],
+        ]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi*' => Http::response(
+            '1. Lee K. Scabies treatment review. A detailed abstract about scabies treatment options including topical permethrin and oral ivermectin for managing the parasitic infestation effectively.'
+        ),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => ['result' => []],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q=kudis&cf=80');
+
+    $response->assertStatus(200)
+        ->assertJson(['status' => true]);
+
+    $wiki = collect($response->json('referensi'))->firstWhere('source_db', 'Wikipedia Indonesia');
+
+    expect($wiki)->not->toBeNull();
+    expect($wiki['is_open_access'])->toBeTrue();
+    expect($wiki['url'])->toBe('https://id.wikipedia.org/wiki/Skabies');
+});
+
+test('skin article prefers europe pmc open access fulltext url', function () {
+    Http::fake([
+        'api.groq.com/*' => Http::sequence()
+            ->push(['choices' => [['message' => ['content' => 'Vitiligo']]]])
+            ->push([
+                'choices' => [['message' => ['content' => "## Tentang Penyakit\nVitiligo [1]."]]],
+                'model' => 'llama-3.3-70b-versatile',
+            ]),
+        'doaj.org/api/*' => Http::response(['results' => []]),
+        'id.wikipedia.org/*' => Http::response(['query' => ['pages' => []]]),
+        'eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi*' => Http::response([
+            'esearchresult' => ['idlist' => []],
+        ]),
+        'www.ebi.ac.uk/europepmc/webservices/rest/search*' => Http::response([
+            'resultList' => [
+                'result' => [
+                    [
+                        'id' => '12121212',
+                        'pmid' => '12121212',
+                        'title' => 'Vitiligo pathogenesis and treatment',
+                        'authorString' => 'Tan A',
+                        'journalTitle' => 'Pigment Journal',
+                        'firstPublicationDate' => '2024-02-01',
+                        'abstractText' => 'A comprehensive review of vitiligo pathogenesis and modern treatment approaches including phototherapy and topical agents for repigmentation.',
+                        'isOpenAccess' => 'Y',
+                        'fullTextUrlList' => [
+                            'fullTextUrl' => [
+                                ['availability' => 'Open access', 'availabilityCode' => 'OA', 'documentStyle' => 'pdf', 'url' => 'https://europepmc.org/articles/PMC12121212?pdf=render'],
+                                ['availability' => 'Open access', 'availabilityCode' => 'OA', 'documentStyle' => 'html', 'url' => 'https://europepmc.org/articles/PMC12121212'],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]),
+    ]);
+
+    $response = $this->getJson('/api/skin-article?q=vitiligo&cf=90');
+
+    $response->assertStatus(200)
+        ->assertJson(['status' => true]);
+
+    $ref = collect($response->json('referensi'))->firstWhere('source_db', 'Europe PMC');
+
+    // Open-access HTML full text is preferred over the paywalled PubMed page
+    expect($ref['url'])->toBe('https://europepmc.org/articles/PMC12121212');
+    expect($ref['is_open_access'])->toBeTrue();
 });

@@ -22,8 +22,11 @@ class SkinArticleController extends Controller
         // Build search queries from disease name
         $queries = $this->buildSearchQueries($penyakit);
 
-        // Fetch from multiple sources in parallel
-        $sources = $this->fetchFromAllSources($queries);
+        // Indonesian local name (without scientific term in parentheses) for DOAJ search
+        $indonesianName = $this->extractIndonesianName($penyakit);
+
+        // Fetch from multiple sources, guaranteeing a mix of Indonesian + international references
+        $sources = $this->fetchFromAllSources($queries, $indonesianName);
 
         if (count($sources) === 0) {
             return response()->json([
@@ -53,6 +56,7 @@ class SkinArticleController extends Controller
 
         INSTRUKSI PENTING:
         - Gunakan HANYA informasi dari sumber-sumber ilmiah berikut
+        - Sumber berisi campuran jurnal Indonesia dan jurnal internasional; perlakukan semua sumber setara
         - JANGAN mengarang atau menambah informasi sendiri
         - Jika informasi tidak tersedia dari sumber, tulis: 'informasi tidak tersedia dari sumber yang dirujuk'
         - Gunakan bahasa Indonesia yang mudah dipahami
@@ -131,6 +135,8 @@ class SkinArticleController extends Controller
             'pubdate' => $src['pubdate'],
             'url' => $src['url'],
             'pmid' => $src['pmid'] ?? null,
+            'issn' => $src['issn'] ?? null,
+            'is_open_access' => $src['is_open_access'] ?? false,
             'source_db' => $src['source_db'],
         ], $sources, array_keys($sources));
 
@@ -227,39 +233,87 @@ class SkinArticleController extends Controller
     }
 
     /**
-     * Fetch articles from PubMed and Europe PMC, merge and deduplicate.
+     * Extract the Indonesian local disease name (without the scientific term in parentheses).
+     * "Panu (Tinea Versicolor)" -> "Panu". Used to search Indonesian-language journals on DOAJ.
+     */
+    private function extractIndonesianName(string $penyakit): string
+    {
+        $localName = trim(preg_replace('/\s*\([^)]+\)/', '', $penyakit));
+        $localName = preg_replace('/[(){}\[\]"\'\/\\\\]/', ' ', $localName !== '' ? $localName : $penyakit);
+
+        return trim(preg_replace('/\s+/', ' ', $localName));
+    }
+
+    /**
+     * Fetch articles from international (PubMed, Europe PMC) and Indonesian (DOAJ) sources,
+     * guaranteeing a mix so references are never fully English. Deduplicated by title.
      *
      * @param  array<int, string>  $queries
-     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, source_db: string}>
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
      */
-    private function fetchFromAllSources(array $queries): array
+    private function fetchFromAllSources(array $queries, string $indonesianName): array
     {
-        $allArticles = [];
+        $maxTotal = 8;
+        $indonesianQuota = 3;
         $seenTitles = [];
 
+        // Indonesian / openable sources searched with the local Indonesian name:
+        // DOAJ journals first (scientific), then Wikipedia Indonesia (always openable).
+        $indonesian = $this->collectUnique([
+            ...$this->fetchDoajIndonesianArticles($indonesianName),
+            ...$this->fetchWikipediaIndonesiaArticles($indonesianName),
+        ], $seenTitles);
+
+        // International sources (PubMed + Europe PMC) across all queries
+        $international = [];
         foreach ($queries as $query) {
-            // Fetch from PubMed and Europe PMC in parallel
-            $pubmedArticles = $this->fetchPubMedArticles($query);
-            $epmcArticles = $this->fetchEuropePmcArticles($query);
+            $batch = [...$this->fetchPubMedArticles($query), ...$this->fetchEuropePmcArticles($query)];
+            $international = [...$international, ...$this->collectUnique($batch, $seenTitles)];
 
-            foreach ([...$pubmedArticles, ...$epmcArticles] as $article) {
-                // Deduplicate by normalized title
-                $normalizedTitle = mb_strtolower(trim($article['title']));
-                if (isset($seenTitles[$normalizedTitle]) || $normalizedTitle === '') {
-                    continue;
-                }
-                $seenTitles[$normalizedTitle] = true;
-                $allArticles[] = $article;
-            }
-
-            // Stop if we have enough articles
-            if (count($allArticles) >= 8) {
+            if (count($international) >= $maxTotal) {
                 break;
             }
         }
 
-        // Limit to 8 articles max to keep AI prompt manageable
-        return array_slice($allArticles, 0, 8);
+        // Compose: reserve up to $indonesianQuota slots for Indonesian sources, fill the rest
+        // with international, then top up with any leftover Indonesian articles.
+        $reservedIndonesian = array_slice($indonesian, 0, $indonesianQuota);
+        $remainingSlots = $maxTotal - count($reservedIndonesian);
+
+        $merged = [
+            ...$reservedIndonesian,
+            ...array_slice($international, 0, $remainingSlots),
+        ];
+
+        if (count($merged) < $maxTotal) {
+            $merged = [...$merged, ...array_slice($indonesian, count($reservedIndonesian))];
+        }
+
+        return array_slice($merged, 0, $maxTotal);
+    }
+
+    /**
+     * Filter a batch of articles down to ones with an unseen, non-empty normalized title.
+     * Mutates $seenTitles to track titles across batches.
+     *
+     * @param  array<int, array{title: string}>  $articles
+     * @param  array<string, bool>  $seenTitles
+     * @return array<int, array{title: string}>
+     */
+    private function collectUnique(array $articles, array &$seenTitles): array
+    {
+        $unique = [];
+
+        foreach ($articles as $article) {
+            $normalizedTitle = mb_strtolower(trim($article['title']));
+            if ($normalizedTitle === '' || isset($seenTitles[$normalizedTitle])) {
+                continue;
+            }
+            $seenTitles[$normalizedTitle] = true;
+            $unique[] = $article;
+        }
+
+        return $unique;
     }
 
     /**
@@ -341,6 +395,8 @@ class SkinArticleController extends Controller
                 'pubdate' => $article['pubdate'] ?? '',
                 'url' => "https://pubmed.ncbi.nlm.nih.gov/{$pmid}/",
                 'abstract' => $abstractMap[$pmid] ?? null,
+                'issn' => $article['issn'] ?? null,
+                'is_open_access' => false,
                 'source_db' => 'PubMed',
             ];
         }
@@ -388,9 +444,14 @@ class SkinArticleController extends Controller
             $pmid = $result['pmid'] ?? null;
             $doi = $result['doi'] ?? null;
             $epmcId = $result['id'] ?? null;
+            $isOpenAccess = ($result['isOpenAccess'] ?? 'N') === 'Y';
 
-            // Build URL: prefer PubMed link if PMID exists, otherwise Europe PMC
-            if ($pmid) {
+            // Prefer a directly-openable open-access full text link so the user does not hit a paywall.
+            $openAccessUrl = $this->resolveEpmcOpenAccessUrl($result);
+
+            if ($openAccessUrl !== null) {
+                $url = $openAccessUrl;
+            } elseif ($pmid) {
                 $url = "https://pubmed.ncbi.nlm.nih.gov/{$pmid}/";
             } elseif ($doi) {
                 $url = "https://doi.org/{$doi}";
@@ -406,11 +467,198 @@ class SkinArticleController extends Controller
                 'pubdate' => $result['firstPublicationDate'] ?? '',
                 'url' => $url,
                 'abstract' => isset($result['abstractText']) ? mb_substr($result['abstractText'], 0, 1500) : null,
+                'issn' => $result['journalInfo']['journal']['issn'] ?? null,
+                'is_open_access' => $isOpenAccess || $openAccessUrl !== null,
                 'source_db' => 'Europe PMC',
             ];
         }
 
         return $articles;
+    }
+
+    /**
+     * Resolve a directly-openable open-access full text URL from a Europe PMC result.
+     * Priority: open-access HTML, then any open-access link, then free full text. Null if none.
+     *
+     * @param  array<string, mixed>  $result
+     */
+    private function resolveEpmcOpenAccessUrl(array $result): ?string
+    {
+        $links = $result['fullTextUrlList']['fullTextUrl'] ?? [];
+
+        $pick = function (callable $matcher) use ($links): ?string {
+            foreach ($links as $link) {
+                if (! empty($link['url']) && $matcher($link)) {
+                    return $link['url'];
+                }
+            }
+
+            return null;
+        };
+
+        return $pick(fn ($l) => ($l['availabilityCode'] ?? '') === 'OA' && ($l['documentStyle'] ?? '') === 'html')
+            ?? $pick(fn ($l) => ($l['availabilityCode'] ?? '') === 'OA')
+            ?? $pick(fn ($l) => ($l['availability'] ?? '') === 'Free');
+    }
+
+    /**
+     * Fetch openable Indonesian-language articles from Wikipedia Indonesia (MediaWiki API, free).
+     * Always open access — useful as a user-friendly, directly-readable reference.
+     *
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
+     */
+    private function fetchWikipediaIndonesiaArticles(string $query): array
+    {
+        if (trim($query) === '') {
+            return [];
+        }
+
+        $response = Http::timeout(15)->get('https://id.wikipedia.org/w/api.php', [
+            'action' => 'query',
+            'generator' => 'search',
+            'gsrsearch' => $query,
+            'gsrlimit' => 2,
+            'prop' => 'extracts|info',
+            'exintro' => 1,
+            'explaintext' => 1,
+            'inprop' => 'url',
+            'format' => 'json',
+        ]);
+
+        if ($response->failed()) {
+            return [];
+        }
+
+        $pages = $response->json('query.pages', []);
+
+        $articles = [];
+        foreach ($pages as $page) {
+            $title = $page['title'] ?? '';
+            $extract = trim($page['extract'] ?? '');
+            if ($title === '' || $extract === '') {
+                continue;
+            }
+
+            $articles[] = [
+                'pmid' => null,
+                'title' => $title,
+                'authors' => 'Artikel Wikipedia',
+                'journal' => 'Wikipedia Indonesia',
+                'pubdate' => '',
+                'url' => $page['fullurl'] ?? 'https://id.wikipedia.org/wiki/'.rawurlencode($title),
+                'abstract' => mb_substr($extract, 0, 1500),
+                'issn' => null,
+                'is_open_access' => true,
+                'source_db' => 'Wikipedia Indonesia',
+            ];
+        }
+
+        return $articles;
+    }
+
+    /**
+     * Fetch Indonesian-language journal articles from the DOAJ API (free, no key required).
+     * Filtered to Indonesian-language journals as a practical proxy for Indonesian (Sinta-indexed)
+     * journals — DOAJ does not expose Sinta accreditation levels.
+     *
+     * @return array<int, array{pmid: ?string, title: string, authors: string, journal: string, pubdate: string, url: string, abstract: ?string, issn: ?string, is_open_access: bool, source_db: string}>
+     */
+    private function fetchDoajIndonesianArticles(string $query): array
+    {
+        if (trim($query) === '') {
+            return [];
+        }
+
+        // Restrict to Indonesian-language journals so references are genuinely Indonesian.
+        $searchQuery = $query.' AND index.language:Indonesian';
+
+        $response = Http::timeout(15)->get(
+            'https://doaj.org/api/search/articles/'.rawurlencode($searchQuery),
+            [
+                'pageSize' => 5,
+                'sort' => 'score:desc',
+            ]
+        );
+
+        if ($response->failed()) {
+            return [];
+        }
+
+        $results = $response->json('results', []);
+
+        $articles = [];
+        foreach ($results as $result) {
+            $bibjson = $result['bibjson'] ?? [];
+            $title = $bibjson['title'] ?? '';
+            if ($title === '') {
+                continue;
+            }
+
+            $authors = collect($bibjson['author'] ?? [])
+                ->pluck('name')
+                ->filter()
+                ->take(3)
+                ->implode(', ');
+
+            if (count($bibjson['author'] ?? []) > 3) {
+                $authors .= ', et al.';
+            }
+
+            $pubdate = trim(($bibjson['month'] ?? '').' '.($bibjson['year'] ?? ''));
+
+            $articles[] = [
+                'pmid' => null,
+                'title' => $title,
+                'authors' => $authors,
+                'journal' => $bibjson['journal']['title'] ?? '',
+                'pubdate' => $pubdate,
+                'url' => $this->resolveDoajUrl($bibjson, $result['id'] ?? null),
+                'abstract' => isset($bibjson['abstract']) ? mb_substr($bibjson['abstract'], 0, 1500) : null,
+                'issn' => $this->extractDoajIssn($bibjson),
+                'is_open_access' => true,
+                'source_db' => 'DOAJ (Jurnal Indonesia)',
+            ];
+        }
+
+        return $articles;
+    }
+
+    /**
+     * Resolve the best public URL for a DOAJ article: fulltext link, then DOI, then DOAJ page.
+     *
+     * @param  array<string, mixed>  $bibjson
+     */
+    private function resolveDoajUrl(array $bibjson, ?string $id): string
+    {
+        foreach ($bibjson['link'] ?? [] as $link) {
+            if (($link['type'] ?? '') === 'fulltext' && ! empty($link['url'])) {
+                return $link['url'];
+            }
+        }
+
+        foreach ($bibjson['identifier'] ?? [] as $identifier) {
+            if (($identifier['type'] ?? '') === 'doi' && ! empty($identifier['id'])) {
+                return 'https://doi.org/'.$identifier['id'];
+            }
+        }
+
+        return $id ? "https://doaj.org/article/{$id}" : 'https://doaj.org';
+    }
+
+    /**
+     * Extract a journal ISSN (print or electronic) from a DOAJ bibjson record.
+     *
+     * @param  array<string, mixed>  $bibjson
+     */
+    private function extractDoajIssn(array $bibjson): ?string
+    {
+        foreach ($bibjson['identifier'] ?? [] as $identifier) {
+            if (in_array($identifier['type'] ?? '', ['pissn', 'eissn'], true) && ! empty($identifier['id'])) {
+                return $identifier['id'];
+            }
+        }
+
+        return null;
     }
 
     /**

@@ -14,7 +14,10 @@ type Referensi = {
     journal: string;
     pubdate: string;
     url: string;
-    pmid: string;
+    pmid: string | null;
+    issn: string | null;
+    is_open_access: boolean;
+    source_db: string;
 };
 
 type ApiResponse = {
@@ -73,7 +76,8 @@ export default function SkinArticleTest() {
                 <div className="space-y-1">
                     <h1 className="text-2xl font-bold tracking-tight">Skin Article API Test</h1>
                     <p className="text-muted-foreground text-sm">
-                        Testing endpoint: GET /api/skin-article — sumber dari PubMed + kesimpulan Groq AI
+                        Testing endpoint: GET /api/skin-article — sumber dari PubMed, Europe PMC, DOAJ & Wikipedia
+                        Indonesia + kesimpulan Groq AI
                     </p>
                 </div>
 
@@ -130,7 +134,7 @@ export default function SkinArticleTest() {
                         <CardContent className="flex flex-col items-center justify-center gap-3 py-12">
                             <Spinner className="size-6" />
                             <span className="text-muted-foreground text-sm">
-                                Mengambil artikel dari PubMed & menyimpulkan dengan Groq AI...
+                                Mengambil artikel dari jurnal & web Indonesia, lalu menyimpulkan dengan Groq AI...
                             </span>
                         </CardContent>
                     </Card>
@@ -143,13 +147,13 @@ export default function SkinArticleTest() {
                                 <div className="flex flex-wrap items-center gap-2">
                                     <CardTitle>{result.penyakit}</CardTitle>
                                     <Badge variant="secondary">CF: {result.cf}%</Badge>
-                                    <Badge variant="outline">{result.jumlah_sumber} sumber PubMed</Badge>
+                                    <Badge variant="outline">{result.jumlah_sumber} sumber</Badge>
                                     <Badge variant="outline">{result.model}</Badge>
                                     <Badge variant="outline">{responseTime}ms</Badge>
                                 </div>
                                 <CardDescription>
-                                    Artikel disimpulkan dari {result.jumlah_sumber} jurnal ilmiah PubMed. Nomor dalam
-                                    kurung siku [1], [2] merujuk ke referensi di bawah.
+                                    Artikel disimpulkan dari {result.jumlah_sumber} sumber ilmiah & web Indonesia. Nomor
+                                    dalam kurung siku [1], [2] merujuk ke referensi di bawah.
                                 </CardDescription>
                             </CardHeader>
                             <CardContent>
@@ -162,17 +166,17 @@ export default function SkinArticleTest() {
 
                         <Card>
                             <CardHeader>
-                                <CardTitle>Referensi Jurnal Ilmiah</CardTitle>
+                                <CardTitle>Referensi</CardTitle>
                                 <CardDescription>
-                                    Sumber asli dari PubMed (National Library of Medicine) — klik untuk membaca artikel
-                                    lengkap
+                                    Sumber dari jurnal ilmiah (PubMed, Europe PMC, DOAJ) & Wikipedia Indonesia. Badge
+                                    hijau = bisa langsung dibuka (akses terbuka). Klik untuk membaca.
                                 </CardDescription>
                             </CardHeader>
                             <CardContent>
                                 <div className="space-y-3">
                                     {result.referensi.map((ref) => (
                                         <a
-                                            key={ref.pmid}
+                                            key={ref.no}
                                             href={ref.url}
                                             target="_blank"
                                             rel="noopener noreferrer"
@@ -188,15 +192,38 @@ export default function SkinArticleTest() {
                                                         {ref.authors}
                                                     </p>
                                                     <div className="flex flex-wrap items-center gap-2">
-                                                        <Badge variant="outline" className="text-xs">
-                                                            {ref.journal}
-                                                        </Badge>
-                                                        <Badge variant="outline" className="text-xs">
-                                                            {ref.pubdate}
-                                                        </Badge>
+                                                        {ref.is_open_access ? (
+                                                            <Badge className="border-transparent bg-green-600 text-xs text-white hover:bg-green-600">
+                                                                Akses Terbuka
+                                                            </Badge>
+                                                        ) : (
+                                                            <Badge variant="secondary" className="text-xs">
+                                                                Abstrak
+                                                            </Badge>
+                                                        )}
                                                         <Badge variant="secondary" className="text-xs">
-                                                            PMID: {ref.pmid}
+                                                            {ref.source_db}
                                                         </Badge>
+                                                        {ref.journal && (
+                                                            <Badge variant="outline" className="text-xs">
+                                                                {ref.journal}
+                                                            </Badge>
+                                                        )}
+                                                        {ref.pubdate && (
+                                                            <Badge variant="outline" className="text-xs">
+                                                                {ref.pubdate}
+                                                            </Badge>
+                                                        )}
+                                                        {ref.pmid && (
+                                                            <Badge variant="outline" className="text-xs">
+                                                                PMID: {ref.pmid}
+                                                            </Badge>
+                                                        )}
+                                                        {ref.issn && (
+                                                            <Badge variant="outline" className="text-xs">
+                                                                ISSN: {ref.issn}
+                                                            </Badge>
+                                                        )}
                                                     </div>
                                                 </div>
                                             </div>
